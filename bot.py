@@ -491,4 +491,6 @@ async def main():
             return
         sku = PENDING_ADD.pop(m.from_user.id, None)
         if not sku:
+            await m.reply("⚠️ No hay producto pendiente.")
+        return
      
