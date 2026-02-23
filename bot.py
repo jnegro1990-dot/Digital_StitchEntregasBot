@@ -3,7 +3,7 @@ import os
 import re
 import uuid
 from datetime import datetime
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 import asyncpg
 from aiogram import Bot, Dispatcher, F
@@ -14,11 +14,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ======================
+# ENV VARS (Railway)
+# ======================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()  # Railway Postgres
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()  # Railway Postgres connection string
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()    # e.g. "123456789,987654321"
 
-CURRENCY = "MXN"
+CURRENCY = os.getenv("CURRENCY", "MXN").strip() or "MXN"
 
 ADMIN_IDS = set()
 if ADMIN_IDS_RAW:
@@ -37,7 +40,7 @@ def now_str() -> str:
 
 
 def money_to_cents(amount_str: str) -> Optional[int]:
-    s = amount_str.strip().replace(",", ".")
+    s = (amount_str or "").strip().replace(",", ".")
     if not re.fullmatch(r"\d+(\.\d{1,2})?", s):
         return None
     if "." in s:
@@ -50,10 +53,13 @@ def money_to_cents(amount_str: str) -> Optional[int]:
 
 def cents_to_money(cents: int) -> str:
     sign = "-" if cents < 0 else ""
-    cents = abs(cents)
-    return f"{sign}${cents//100}.{cents%100:02d} {CURRENCY}"
+    cents = abs(int(cents))
+    return f"{sign}${cents // 100}.{cents % 100:02d} {CURRENCY}"
 
 
+# ======================
+# KEYBOARDS
+# ======================
 def main_menu_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="🛒 Comprar códigos", callback_data="menu:buy")
@@ -68,12 +74,18 @@ def main_menu_kb():
 def products_kb(rows: List[Tuple[str, str, int]]):
     kb = InlineKeyboardBuilder()
     for sku, name, price_cents in rows:
-        kb.button(text=f"{name} — {cents_to_money(int(price_cents))}", callback_data=f"buy:{sku}")
+        kb.button(
+            text=f"{name} — {cents_to_money(int(price_cents))}",
+            callback_data=f"buy:{sku}"
+        )
     kb.button(text="⬅️ Volver", callback_data="menu:back")
     kb.adjust(1)
     return kb.as_markup()
 
 
+# ======================
+# DB LAYER
+# ======================
 class DB:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
@@ -88,12 +100,14 @@ class DB:
                 balance_cents INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             );
+
             CREATE TABLE IF NOT EXISTS products (
                 sku TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 price_cents INTEGER NOT NULL,
                 active BOOLEAN NOT NULL DEFAULT TRUE
             );
+
             CREATE TABLE IF NOT EXISTS codes (
                 id BIGSERIAL PRIMARY KEY,
                 sku TEXT NOT NULL REFERENCES products(sku),
@@ -149,15 +163,27 @@ class DB:
             return int(row["balance_cents"]) if row else 0
 
     async def user_id_by_username(self, username: str) -> Optional[int]:
-        u = username.lstrip("@").strip()
+        u = (username or "").lstrip("@").strip()
+        if not u:
+            return None
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow("SELECT telegram_id FROM users WHERE username=$1", u)
             return int(row["telegram_id"]) if row else None
 
-    async def set_balance_with_move(self, telegram_id: int, new_balance: int, move_type: str, amount_cents: int, ref: str = ""):
+    async def set_balance_with_move(
+        self,
+        telegram_id: int,
+        new_balance: int,
+        move_type: str,
+        amount_cents: int,
+        ref: str = ""
+    ):
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                row = await conn.fetchrow("SELECT balance_cents FROM users WHERE telegram_id=$1 FOR UPDATE", telegram_id)
+                row = await conn.fetchrow(
+                    "SELECT balance_cents FROM users WHERE telegram_id=$1 FOR UPDATE",
+                    telegram_id
+                )
                 if not row:
                     return
                 before = int(row["balance_cents"])
@@ -217,30 +243,28 @@ class DB:
                 return n
 
     async def deliver_purchase(self, telegram_id: int, sku: str) -> Tuple[bool, str]:
-        # Load product
         async with self.pool.acquire() as conn:
             prod = await conn.fetchrow("SELECT name, price_cents, active FROM products WHERE sku=$1", sku)
+
         if not prod:
-            return False, "Producto no existe."
+            return False, "❌ Producto no existe."
         if not bool(prod["active"]):
-            return False, "Producto no está disponible."
+            return False, "⚠️ Producto no está disponible."
 
         name = prod["name"]
         price_cents = int(prod["price_cents"])
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                # Lock user balance
                 u = await conn.fetchrow("SELECT balance_cents FROM users WHERE telegram_id=$1 FOR UPDATE", telegram_id)
                 if not u:
-                    return False, "Usuario no registrado. Usa /start."
+                    return False, "❌ Usuario no registrado. Usa /start."
                 balance = int(u["balance_cents"])
 
                 if balance < price_cents:
                     faltan = price_cents - balance
                     return False, f"❌ Saldo insuficiente. Te faltan {cents_to_money(faltan)}."
 
-                # Pick 1 available code with row lock (safe under concurrency)
                 code_row = await conn.fetchrow("""
                     SELECT id, code FROM codes
                     WHERE sku=$1 AND status='available'
@@ -259,20 +283,17 @@ class DB:
                 delivered_at = now_str()
                 new_balance = balance - price_cents
 
-                # Mark code delivered
                 await conn.execute("""
                     UPDATE codes
                     SET status='delivered', delivered_at=$2, buyer_telegram_id=$3, order_id=$4
                     WHERE id=$1
                 """, code_id, delivered_at, telegram_id, order_id)
 
-                # Create order
                 await conn.execute("""
                     INSERT INTO orders(order_id, telegram_id, sku, price_cents, status, created_at, delivered_at)
                     VALUES($1,$2,$3,$4,'paid_delivered',$5,$5)
                 """, order_id, telegram_id, sku, price_cents, delivered_at)
 
-                # Update balance + move
                 await conn.execute("UPDATE users SET balance_cents=$2 WHERE telegram_id=$1", telegram_id, new_balance)
                 await conn.execute("""
                     INSERT INTO balance_moves(telegram_id,type,amount_cents,balance_before_cents,balance_after_cents,ref,created_at)
@@ -280,11 +301,11 @@ class DB:
                 """, telegram_id, -price_cents, balance, new_balance, f"order:{order_id}", delivered_at)
 
         return True, (
-            f"✅ Compra confirmada\n"
-            f"Producto: {name}\n"
+            f"✅ *Compra confirmada*\n"
+            f"Producto: *{name}*\n"
             f"Código:\n`{code_value}`\n\n"
             f"Orden: `{order_id}`\n"
-            f"Saldo restante: {cents_to_money(new_balance)}"
+            f"Saldo restante: *{cents_to_money(new_balance)}*"
         )
 
     async def my_orders_text(self, telegram_id: int) -> str:
@@ -300,21 +321,29 @@ class DB:
         if not rows:
             return "Aún no tienes compras registradas."
 
-        lines = ["📦 Tus últimas compras (máx. 10):"]
+        lines = ["📦 *Tus últimas compras (máx. 10):*"]
         for r in rows:
-            lines.append(f"- {r['delivered_at']} | {r['sku']} | {cents_to_money(int(r['price_cents']))} | Orden {r['order_id']}")
+            lines.append(
+                f"- {r['delivered_at']} | `{r['sku']}` | {cents_to_money(int(r['price_cents']))} | Orden `{r['order_id']}`"
+            )
         return "\n".join(lines)
 
 
-PENDING_ADD = {}  # admin_id -> sku
+# ======================
+# ADMIN: pending sku by admin_id
+# ======================
+PENDING_ADD: Dict[int, str] = {}
 
 
+# ======================
+# MAIN
+# ======================
 async def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Falta BOT_TOKEN en variables de entorno.")
+        raise RuntimeError("Falta BOT_TOKEN en variables de entorno (Railway Variables).")
 
     if not DATABASE_URL:
-        raise RuntimeError("Falta DATABASE_URL. Agrega PostgreSQL en Railway para que funcione 24/7 con datos persistentes.")
+        raise RuntimeError("Falta DATABASE_URL. Agrega PostgreSQL en Railway y usa su URL.")
 
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     db = DB(pool)
@@ -323,6 +352,7 @@ async def main():
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher()
 
+    # -------- USER COMMANDS --------
     @dp.message(CommandStart())
     async def start(m: Message):
         await db.upsert_user(m.from_user.id, m.from_user.username, m.from_user.first_name)
@@ -368,7 +398,7 @@ async def main():
 
         elif action == "orders":
             txt = await db.my_orders_text(call.from_user.id)
-            await call.message.edit_text(txt, reply_markup=main_menu_kb())
+            await call.message.edit_text(txt, parse_mode="Markdown", reply_markup=main_menu_kb())
 
         elif action == "support":
             await call.message.edit_text(
@@ -391,8 +421,7 @@ async def main():
         else:
             await call.message.edit_text(msg, reply_markup=main_menu_kb())
 
-    # ---------------- ADMIN COMMANDS ----------------
-
+    # -------- ADMIN HELP --------
     @dp.message(Command("admin"))
     async def admin_help(m: Message):
         if not is_admin(m.from_user.id):
@@ -403,19 +432,20 @@ async def main():
             "`/restar @usuario 50`\n"
             "`/saldo @usuario`\n\n"
             "`/addcodes SKU` (luego pega códigos, 1 por línea)\n"
-            "`/done` (termina carga)\n\n"
+            "`/done` (salir del modo carga)\n\n"
             "`/stock` o `/stock SKU`\n"
-            "`/precio SKU 129`\n"
+            "`/precio SKU 129` (MXN)\n"
             "`/nombre SKU Nombre Bonito`\n"
             "`/activar SKU` | `/desactivar SKU`\n",
             parse_mode="Markdown"
         )
 
+    # -------- ADMIN BALANCE --------
     @dp.message(Command("saldo"))
     async def admin_saldo(m: Message):
         if not is_admin(m.from_user.id):
             return
-        parts = m.text.split()
+        parts = (m.text or "").split()
         if len(parts) != 2:
             await m.answer("Uso: /saldo @usuario")
             return
@@ -430,7 +460,7 @@ async def main():
     async def admin_sumar(m: Message):
         if not is_admin(m.from_user.id):
             return
-        parts = m.text.split()
+        parts = (m.text or "").split()
         if len(parts) != 3:
             await m.answer("Uso: /sumar @usuario 200")
             return
@@ -451,7 +481,7 @@ async def main():
     async def admin_restar(m: Message):
         if not is_admin(m.from_user.id):
             return
-        parts = m.text.split()
+        parts = (m.text or "").split()
         if len(parts) != 3:
             await m.answer("Uso: /restar @usuario 50")
             return
@@ -468,29 +498,11 @@ async def main():
         await db.set_balance_with_move(uid, after, "admin_adjust", -cents, ref=f"admin:{m.from_user.id}")
         await m.answer(f"✅ Ajuste aplicado a {parts[1]}. Nuevo saldo: {cents_to_money(after)}")
 
-    @dp.message(Command("addcodes"))
-    async def admin_addcodes(m: Message):
+    # -------- ADMIN PRODUCTS / STOCK --------
+    @dp.message(Command("stock"))
+    async def admin_stock(m: Message):
         if not is_admin(m.from_user.id):
             return
-        parts = m.text.split(maxsplit=1)
-        if len(parts) != 2:
-            await m.answer("Uso: /addcodes DISNEY_1M")
-            return
-        sku = parts[1].strip().upper()
-        PENDING_ADD[m.from_user.id] = sku
-        await db.ensure_product(sku, name=sku, price_cents=0)
-        await m.answer(
-            f"📥 Listo. Pega los códigos para `{sku}` (uno por línea).\n"
-            f"Cuando termines escribe `/done`.",
-            parse_mode="Markdown"
-        )
-
-    @dp.message(Command("done"))
-    async def admin_done(m: Message):
-        if not is_admin(m.from_user.id):
-            return
-        sku = PENDING_ADD.pop(m.from_user.id, None)
-        if not sku:
-            await m.reply("⚠️ No hay producto pendiente.")
-            return
-     
+        parts = (m.text or "").split(maxsplit=1)
+        if len(parts) == 1:
+            rows = aw
