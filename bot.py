@@ -489,4 +489,19 @@ async def main():
         if not is_admin(m.from_user.id):
             return
         payload = PENDING_ADD.pop(m.from_user.id, None)
-        if not 
+        if not text:
+            return
+        lines = [x.strip() for x in text.splitlines() if x.strip()]
+        payload["codes"].extend(lines)
+        await m.reply(f"📌 Agregados {len(lines)} (pendientes totales: {len(payload['codes'])}). Escribe /done para guardar.")
+
+    # ---- START POLLING ----
+    try:
+        print("✅ Polling iniciado.")
+        await dp.start_polling(bot)
+    finally:
+        await pool.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
